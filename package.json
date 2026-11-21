@@ -1,0 +1,14 @@
+{
+  "name": "cycloth",
+  "version": "1.0.0",
+  "description": "A local Streamlit web-app that tells you **whether to ride** and **what to wear from your own cycling wardrobe**, based on your route and a live multi-source weather ensemble.",
+  "main": "index.js",
+  "scripts": {},
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@playwright/test": "^1.65.1",
+    "@types/node": "^26.6.6"
+  }
+}
