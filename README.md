@@ -23,7 +23,7 @@ playwright install chromium
 |---|---|
 | `app.py` | Streamlit interface: *Plan ride*, *My wardrobe*, *Method & sources* |
 | `wardrobe.py` | Item model, body slots, starter catalogue with typical comfort ranges, JSON storage |
-| `routing.py` | PDOK geocoding, OSRM bicycle routing, GPX import, route segmentation and headings |
+| `routing.py` | PDOK geocoding, bicycle routing via BRouter / Valhalla / OSRM (shortest kept), GPX import, route segmentation and headings |
 | `weather_sources.py` | Live fetchers: Open-Meteo (KNMI HARMONIE, DWD ICON, Météo-France AROME, ECMWF, GFS), MET Norway, Buienradar radar nowcast + stations, MeteoAlarm (KNMI warnings) |
 | `advisor.py` | Weighted ensemble + radar/station fusion, ride simulation, felt temperature, outfit selection, go/no-go verdict, best-departure scan |
 | `decathlon.py` | Optional Decathlon NL comfort-temperature reader |
@@ -39,6 +39,9 @@ playwright install chromium
    * *Upload a GPX file*: a track or route exported from Komoot, Strava, Garmin, RouteYou, etc. (GPX 1.0/1.1; track
      points are used first, then route points, then waypoints). Optionally ride it in reverse or there-and-back. For
      sparse route-planner files (≤ 25 route points) the app can follow bike roads between the points.
+   For start → destination, three bike routers (BRouter trekking, Valhalla, OSRM) are compared as soon as both places
+   are set; *Auto* uses the shortest route, and the app warns when a route is more than 1.5x the straight-line distance.
+   For *There and back*, the return time defaults to your arrival time (route distance / average speed).
    Then choose the departure time and how flexible you are.
 3. Read the verdict (GO / GO WITH CAUTION / RECONSIDER), the outfit per leg (what to wear, what to take along, what to
    add or stow for the return), the headwind map, the source comparison, and the best departure time in your window.

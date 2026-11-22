@@ -35,9 +35,12 @@ def cached_geocode(q: str):
     return [asdict(p) for p in routing.geocode(q)]
 
 
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-def cached_route(waypoints: tuple):
-    return routing.bike_route(list(waypoints))
+@st.cache_data(ttl=6 * 3600, show_spinner=False, max_entries=50)
+def cached_route_candidates(waypoints: tuple):
+    cands = routing.route_candidates(list(waypoints))
+    if not any(c["error"] is None for c in cands):
+        routing.choose_route(cands)          # raises with every engine's error
+    return cands
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False, max_entries=20)
@@ -73,11 +76,17 @@ def local(ts: pd.Timestamp, fmt="%H:%M") -> str:
 # ==========================================================================
 with st.sidebar:
     st.header("Rider profile")
-    speed = st.slider("Average speed (km/h)", 8.0, 40.0, float(S["speed_kmh"]), 0.5)
-    intensity = st.selectbox("Effort", list(adv.INTENSITY), index=list(adv.INTENSITY).index(S["intensity"])
-                             if S["intensity"] in adv.INTENSITY else 1,
+    # widgets are keyed and initialised once from the saved settings, so their identity stays stable
+    st.session_state.setdefault("pref_speed", float(S["speed_kmh"]))
+    st.session_state.setdefault("pref_intensity", S["intensity"] if S["intensity"] in adv.INTENSITY
+                                else "Moderate (touring)")
+    st.session_state.setdefault("pref_personal", float(S["personal_offset"]))
+    for _n, _d in ws.DEFAULT_WEIGHTS.items():
+        st.session_state.setdefault(f"w_{_n}", float(S["weights"].get(_n, _d)))
+    speed = st.slider("Average speed (km/h)", 8.0, 40.0, step=0.5, key="pref_speed")
+    intensity = st.selectbox("Effort", list(adv.INTENSITY), key="pref_intensity",
                              help="Harder effort produces more body heat, so you can dress lighter.")
-    personal = st.slider("I usually feel ...", -4.0, 4.0, float(S["personal_offset"]), 0.5,
+    personal = st.slider("I usually feel ...", -4.0, 4.0, step=0.5, key="pref_personal",
                          help="Negative = you get cold easily (advice dresses you warmer). "
                               "Positive = you run hot.")
     st.caption("cold-sensitive  ◀  0  ▶  runs hot")
@@ -85,7 +94,7 @@ with st.sidebar:
         st.caption("Relative weight of each forecast in the ensemble (0 = ignore).")
         weights = {}
         for name, default in ws.DEFAULT_WEIGHTS.items():
-            weights[name] = st.slider(name, 0.0, 3.0, float(S["weights"].get(name, default)), 0.1, key=f"w_{name}")
+            weights[name] = st.slider(name, 0.0, 3.0, step=0.1, key=f"w_{name}")
     favs_ = S.setdefault("places", {})
     with st.expander(f"Favorite places ({len(favs_)})"):
         if not favs_:
@@ -309,18 +318,60 @@ with tab_plan:
                 st.caption("Unknown route: the headwind is modelled for half of the loop.")
             else:
                 dest = place_picker("dest", "Destination")
+    route_choice = None
+    if not use_gpx and mode != "loop" and start is not None and dest is not None:
+        try:
+            with st.spinner("Comparing bike routes (BRouter, Valhalla, OSRM) ..."):
+                cands = cached_route_candidates(((start.lat, start.lon), (dest.lat, dest.lon)))
+            ok = [c for c in cands if c["error"] is None]
+            mains = {c["engine"]: c for c in ok if c["alt"] == 0}
+            shortest = min(ok, key=lambda c: c["distance_m"])
+            opts = ["auto"] + [e for e in routing.ENGINES if e in mains]
+            fmt = lambda e: (f"Auto - shortest ({shortest['label']}, {shortest['distance_m'] / 1000:.1f} km)"  # noqa: E731
+                             if e == "auto" else f"{routing.ENGINES[e]}, {mains[e]['distance_m'] / 1000:.1f} km")
+            r1, r2 = st.columns([1, 1])
+            eng = r1.selectbox("Routing engine", opts, format_func=fmt,
+                               help="Three independent bicycle routers are compared; 'Auto' uses the shortest route.")
+            route_choice = routing.choose_route(cands, eng)
+            failed = [c["label"] for c in cands if c["error"]]
+            r2.caption(f"Route **{route_choice['distance_m'] / 1000:.1f} km** via {route_choice['label']} · "
+                       f"straight line {route_choice['straight_m'] / 1000:.1f} km (x{route_choice['detour']:.2f})"
+                       + (f" · unavailable: {', '.join(failed)}" if failed else ""))
+            if route_choice["detour"] > 1.5 and route_choice["straight_m"] > 5000:
+                st.warning(f"This route is {route_choice['detour']:.1f}x the straight-line distance - check it on the "
+                           "map, try another routing engine, or upload your own GPX.")
+        except Exception as e:  # noqa: BLE001
+            st.warning(f"No bike route available yet: {e}")
+
     now_l = datetime.now(TZ)
     d1, d2, d3, d4 = st.columns(4)
-    dep_date = d1.date_input("Departure date", now_l.date(), min_value=now_l.date(),
-                             max_value=now_l.date() + timedelta(days=3))
-    default_t = (now_l + timedelta(minutes=15 - now_l.minute % 15)).time().replace(second=0, microsecond=0)
-    dep_time = d2.time_input("Departure time", default_t, step=timedelta(minutes=15))
+    if "dep_date" not in st.session_state or st.session_state.dep_date < now_l.date():
+        st.session_state.dep_date = now_l.date()
+    if "dep_time" not in st.session_state:
+        st.session_state.dep_time = (now_l + timedelta(minutes=15 - now_l.minute % 15)).time().replace(
+            second=0, microsecond=0)
+    dep_date = d1.date_input("Departure date", min_value=now_l.date(), max_value=now_l.date() + timedelta(days=3),
+                             key="dep_date")
+    dep_time = d2.time_input("Departure time", step=timedelta(minutes=15), key="dep_time")
     ret_dt = None
     if mode == "return":
-        rd = d3.date_input("Return date", dep_date, min_value=dep_date, max_value=now_l.date() + timedelta(days=3))
-        rt_ = d4.time_input("Return departure", (datetime.combine(dep_date, dep_time) + timedelta(hours=8)).time(),
-                            step=timedelta(minutes=15))
+        # default: return straight after arriving (ride time from route distance and average speed)
+        if route_choice is not None:
+            ride_m = route_choice["distance_m"]
+        elif use_gpx and gpx_route is not None:
+            ride_m = gpx_route["distance_m"]
+        elif start is not None and dest is not None:
+            ride_m = 1.3 * routing.haversine(start.lat, start.lon, dest.lat, dest.lon)
+        else:
+            ride_m = 0.0
+        arrive = datetime.combine(dep_date, dep_time) + timedelta(hours=ride_m / 1000 / speed)
+        arrive += timedelta(minutes=(-arrive.minute) % 5, seconds=-arrive.second, microseconds=-arrive.microsecond)
+        max_d = now_l.date() + timedelta(days=3)
+        rd = d3.date_input("Return date", min(arrive.date(), max_d), min_value=dep_date, max_value=max_d)
+        rt_ = d4.time_input("Return departure", arrive.time(), step=timedelta(minutes=5))
         ret_dt = datetime.combine(rd, rt_, tzinfo=TZ)
+        if ride_m > 0:
+            d4.caption(f"Arrival ≈ {arrive:%H:%M} ({ride_m / 1000:.0f} km at {speed:g} km/h)")
     flex = st.slider("Flexible departure (± hours) - suggest the best time", 0, 6, 2)
 
     ready = gpx_route is not None if use_gpx else (start is not None and (mode == "loop" or dest is not None))
@@ -334,12 +385,13 @@ with tab_plan:
                     if gpx_rev:
                         route = routing.reverse_route(route)
                     if gpx_snap:
-                        route = cached_route(tuple(route["coords"]))
+                        route = routing.choose_route(cached_route_candidates(tuple(route["coords"])), "auto")
                     sp = routing.sample_points(route["coords"])
                 elif mode == "loop":
                     route, sp = None, [(start.lat, start.lon, 0.0)]
                 else:
-                    route = cached_route(((start.lat, start.lon), (dest.lat, dest.lon)))
+                    route = route_choice or routing.choose_route(
+                        cached_route_candidates(((start.lat, start.lon), (dest.lat, dest.lon))), "auto")
                     sp = routing.sample_points(route["coords"])
                 pts = tuple((round(a, 4), round(b, 4)) for a, b, _ in sp)
                 data = cached_weather(pts)
@@ -422,6 +474,9 @@ with tab_plan:
         with m1:
             st.markdown("#### Route and wind")
             show_map(R["route"]["coords"] if R["route"] else None, allseg, R["pts"])
+            if R["route"] and R["route"].get("label"):
+                st.caption(f"Route by {R['route']['label']}: {R['route']['distance_m'] / 1000:.1f} km "
+                           f"(x{R['route']['detour']:.2f} the straight line).")
         with m2:
             st.markdown("#### Sources compared")
             s0 = plan["legs"][0]["stats"]

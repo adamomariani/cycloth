@@ -2,7 +2,7 @@
 
 Both services are free and keyless:
   * PDOK Locatieserver - official Dutch address / place geocoder (Kadaster)
-  * routing.openstreetmap.de/routed-bike - FOSSGIS-hosted OSRM, bicycle profile
+  * Bicycle routing via three engines (BRouter, Valhalla, OSRM), shortest kept by default
 """
 from __future__ import annotations
 
@@ -53,18 +53,139 @@ def geocode(query: str, rows: int = 6) -> list[Place]:
     return out
 
 
-def bike_route(waypoints: list[tuple[float, float]]) -> dict:
-    """Route through (lat, lon) waypoints. Returns coords [(lat, lon)], distance_m, duration_s."""
+# --------------------------------------------------------------------------
+# Bicycle routing - three independent engines, compared and cross-checked
+#   BRouter  (brouter.de, "trekking" profile: touring / everyday cycling)
+#   Valhalla (valhalla1.openstreetmap.de, FOSSGIS, bicycle costing, hybrid bike)
+#   OSRM     (routing.openstreetmap.de, FOSSGIS, bike profile, with alternatives)
+# A single engine can produce large detours on long trips (e.g. OSRM's bike
+# profile optimises a crude travel-time model), so by default the shortest
+# successful route is used and every engine's distance is reported.
+# --------------------------------------------------------------------------
+ENGINES = {"brouter": "BRouter (trekking)", "valhalla": "Valhalla (bicycle)", "osrm": "OSRM (bike)"}
+ROUTE_TIMEOUT = 45
+
+
+def decode_polyline(encoded: str, precision: int = 6) -> list[tuple[float, float]]:
+    """Decode a Google-style encoded polyline into [(lat, lon)]."""
+    coords, idx, lat, lon, f = [], 0, 0, 0, 10 ** precision
+    while idx < len(encoded):
+        for which in (0, 1):
+            shift = result = 0
+            while True:
+                b = ord(encoded[idx]) - 63
+                idx += 1
+                result |= (b & 0x1F) << shift
+                shift += 5
+                if b < 0x20:
+                    break
+            d = ~(result >> 1) if result & 1 else result >> 1
+            if which == 0:
+                lat += d
+            else:
+                lon += d
+        coords.append((lat / f, lon / f))
+    return coords
+
+
+def _route_brouter(waypoints) -> list[dict]:
+    r = requests.get("https://brouter.de/brouter", params={
+        "lonlats": "|".join(f"{lon:.6f},{lat:.6f}" for lat, lon in waypoints),
+        "profile": "trekking", "alternativeidx": 0, "format": "geojson"}, timeout=ROUTE_TIMEOUT)
+    if r.status_code != 200:
+        raise RuntimeError(r.text.strip()[:200] or f"HTTP {r.status_code}")
+    f = r.json()["features"][0]
+    pts = [(c[1], c[0]) for c in f["geometry"]["coordinates"]]
+    pr = f.get("properties", {})
+    dist = float(pr.get("track-length") or path_length(pts))
+    dur = pr.get("total-time")
+    return [{"coords": pts, "distance_m": dist, "duration_s": float(dur) if dur not in (None, "") else None}]
+
+
+def _route_valhalla(waypoints) -> list[dict]:
+    body = {"locations": [{"lat": lat, "lon": lon} for lat, lon in waypoints], "costing": "bicycle",
+            "costing_options": {"bicycle": {"bicycle_type": "Hybrid", "use_roads": 0.3}},
+            "units": "kilometers", "directions_type": "none"}
+    if len(waypoints) == 2:
+        body["alternates"] = 1
+    r = requests.post("https://valhalla1.openstreetmap.de/route", json=body, timeout=ROUTE_TIMEOUT)
+    j = r.json()
+    if r.status_code != 200 or "trip" not in j:
+        raise RuntimeError(str(j.get("error", f"HTTP {r.status_code}"))[:200])
+    out = []
+    for trip in [j["trip"]] + [a["trip"] for a in j.get("alternates", []) if "trip" in a]:
+        pts = []
+        for leg in trip["legs"]:
+            seg = decode_polyline(leg["shape"], 6)
+            pts += seg if not pts else seg[1:]
+        out.append({"coords": pts, "distance_m": trip["summary"]["length"] * 1000.0,
+                    "duration_s": trip["summary"].get("time")})
+    return out
+
+
+def _route_osrm(waypoints) -> list[dict]:
     coords = ";".join(f"{lon:.6f},{lat:.6f}" for lat, lon in waypoints)
-    r = requests.get(OSRM_URL.format(coords=coords),
-                     params={"overview": "full", "geometries": "geojson"}, timeout=TIMEOUT)
+    params = {"overview": "full", "geometries": "geojson"}
+    if len(waypoints) == 2:
+        params["alternatives"] = "3"
+    r = requests.get(OSRM_URL.format(coords=coords), params=params, timeout=ROUTE_TIMEOUT)
     r.raise_for_status()
     j = r.json()
     if j.get("code") != "Ok" or not j.get("routes"):
-        raise RuntimeError(f"Routing failed: {j.get('code')} {j.get('message', '')}")
-    rt = j["routes"][0]
-    pts = [(lat, lon) for lon, lat in rt["geometry"]["coordinates"]]
-    return {"coords": pts, "distance_m": rt["distance"], "duration_s": rt["duration"]}
+        raise RuntimeError(f"{j.get('code')} {j.get('message', '')}")
+    return [{"coords": [(lat, lon) for lon, lat in rt["geometry"]["coordinates"]],
+             "distance_m": rt["distance"], "duration_s": rt["duration"]} for rt in j["routes"]]
+
+
+_ENGINE_FUNCS = {"brouter": _route_brouter, "valhalla": _route_valhalla, "osrm": _route_osrm}
+
+
+def route_candidates(waypoints: list[tuple[float, float]]) -> list[dict]:
+    """Query all engines in parallel. Each candidate: engine, label, coords, distance_m,
+    duration_s, alt (0 = engine's main route), detour (distance / straight line), error."""
+    from concurrent.futures import ThreadPoolExecutor
+    waypoints = [tuple(w) for w in waypoints]
+    straight = path_length(waypoints)
+    out = []
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futs = {k: ex.submit(fn, waypoints) for k, fn in _ENGINE_FUNCS.items()}
+        for k, fu in futs.items():
+            try:
+                routes = fu.result()
+            except Exception as e:  # noqa: BLE001
+                out.append({"engine": k, "label": ENGINES[k], "error": f"{type(e).__name__}: {e}"[:250]})
+                continue
+            for i, rt in enumerate(routes):
+                if len(rt["coords"]) < 2:
+                    continue
+                out.append({"engine": k, "label": ENGINES[k] + (f" alt. {i}" if i else ""), "alt": i,
+                            "error": None, "straight_m": straight,
+                            "detour": rt["distance_m"] / straight if straight > 0 else 1.0, **rt})
+    return out
+
+
+def choose_route(cands: list[dict], engine: str = "auto") -> dict:
+    """engine = 'auto' (shortest successful route) or an ENGINES key (its main route)."""
+    ok = [c for c in cands if not c.get("error")]
+    if not ok:
+        errs = "; ".join(f"{c['label']}: {c['error']}" for c in cands)
+        raise RuntimeError(f"No bicycle route found ({errs})")
+    pool = [c for c in ok if c["engine"] == engine and c["alt"] == 0] if engine != "auto" else ok
+    best = dict(min(pool or ok, key=lambda c: c["distance_m"]))
+    best["candidates"] = [{"label": c["label"], "engine": c["engine"],
+                           "distance_km": None if c.get("error") else c["distance_m"] / 1000,
+                           "error": c.get("error")} for c in cands]
+    return best
+
+
+def bike_route(waypoints: list[tuple[float, float]], engine: str = "auto") -> dict:
+    """Route through (lat, lon) waypoints. Returns coords [(lat, lon)], distance_m, duration_s,
+    engine, label, detour and a summary of all engine candidates."""
+    return choose_route(route_candidates(waypoints), engine)
+
+
+def path_length(pts) -> float:
+    return sum(haversine(a[0], a[1], b[0], b[1]) for a, b in zip(pts[:-1], pts[1:]))
 
 
 # --------------------------------------------------------------------------
