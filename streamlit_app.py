@@ -86,6 +86,21 @@ with st.sidebar:
         weights = {}
         for name, default in ws.DEFAULT_WEIGHTS.items():
             weights[name] = st.slider(name, 0.0, 3.0, float(S["weights"].get(name, default)), 0.1, key=f"w_{name}")
+    favs_ = S.setdefault("places", {})
+    with st.expander(f"Favorite places ({len(favs_)})"):
+        if not favs_:
+            st.caption("No favorites yet. Search an address on **Plan ride** and use *Save as favorite*.")
+        for fav_name, fav in list(favs_.items()):
+            fc1, fc2 = st.columns([5, 1], vertical_alignment="center")
+            fc1.markdown(f"**{fav_name}**  \n{fav['label']}  \n`{fav['lat']:.5f}, {fav['lon']:.5f}`")
+            if fc2.button(":material/delete:", key=f"delfav_{fav_name}", help=f"Remove '{fav_name}'"):
+                favs_.pop(fav_name, None)
+                persist_settings()
+                for k in ("start_fav", "dest_fav"):           # drop a now-invalid selection
+                    if st.session_state.get(k) == fav_name:
+                        del st.session_state[k]
+                st.toast(f"Removed favorite '{fav_name}'.")
+                st.rerun()
     new = {"speed_kmh": speed, "intensity": intensity, "personal_offset": personal, "weights": weights}
     if any(S.get(k) != v for k, v in new.items()):
         S.update(new)
@@ -94,6 +109,11 @@ with st.sidebar:
         cached_weather.clear()
         st.toast("Weather cache cleared - the next advice uses fresh data.")
     st.caption(f"Data stored in `{wd.DATA_DIR}`")
+
+for _k in ("start", "dest"):
+    _saved = st.session_state.pop(f"{_k}_fav_saved", None)
+    if _saved:
+        st.toast(f"Saved favorite '{_saved}'.")
 
 prefs = {"speed_kmh": speed, "intensity": intensity, "personal_offset": personal}
 
@@ -106,13 +126,17 @@ tab_plan, tab_wardrobe, tab_method = st.tabs(["Plan ride", "My wardrobe", "Metho
 # ==========================================================================
 def place_picker(key: str, label: str):
     favs = S.get("places", {})
-    choice = st.selectbox(label, ["Search address ..."] + list(favs), key=f"{key}_fav")
-    if choice != "Search address ...":
-        f = favs[choice]
-        st.caption(f["label"])
-        return routing.Place(f["label"], f["lat"], f["lon"])
-    q = st.text_input("Address, street, town, postcode or 'lat, lon'", key=f"{key}_q",
-                      placeholder="e.g. Stationsplein Wageningen")
+    if favs:
+        # dropdown only when at least one favorite exists; clear it to search an address instead
+        choice = st.selectbox(label, list(favs), index=None, placeholder="Search favorites...", key=f"{key}_fav")
+        if choice is not None and choice in favs:
+            f = favs[choice]
+            st.caption(f["label"])
+            return routing.Place(f["label"], f["lat"], f["lon"])
+        q_label = "... or search an address, street, town, postcode or 'lat, lon'"
+    else:
+        q_label = f"{label}: address, street, town, postcode or 'lat, lon'"
+    q = st.text_input(q_label, key=f"{key}_q", placeholder="e.g. Stationsplein Wageningen")
     if not q:
         return None
     try:
@@ -127,12 +151,13 @@ def place_picker(key: str, label: str):
     p = routing.Place(**res[i])
     if not routing.in_netherlands(p.lat, p.lon):
         st.warning("This location is outside the Netherlands; Buienradar and HARMONIE coverage may be missing.")
-    with st.popover("Save as favourite"):
+    with st.popover("Save as favorite"):
         nm = st.text_input("Name", key=f"{key}_favname", placeholder="Home / Work")
-        if st.button("Save", key=f"{key}_favsave") and nm:
-            S.setdefault("places", {})[nm] = asdict(p)
+        if st.button("Save", key=f"{key}_favsave") and nm.strip():
+            S.setdefault("places", {})[nm.strip()] = asdict(p)
             persist_settings()
-            st.success(f"Saved '{nm}'.")
+            st.session_state[f"{key}_fav_saved"] = nm.strip()
+            st.rerun()
     return p
 
 

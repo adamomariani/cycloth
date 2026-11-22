@@ -33,7 +33,9 @@ playwright install chromium
    flags (waterproof, windproof, long sleeves/legs, reflective, lens type). Press **Save wardrobe**.
 2. **Plan ride** – pick the route source:
    * *Start → destination*: choose *One way*, *There and back* (with return time) or *Loop*; type an address, street,
-     town or postcode; save frequent places as favourites.
+     town or postcode, and use *Save as favorite* for frequent places. Once at least one favorite exists, a
+     *Search favorites...* dropdown appears above the address field. View and remove favorites under
+     **Favorite places** in the sidebar.
    * *Upload a GPX file*: a track or route exported from Komoot, Strava, Garmin, RouteYou, etc. (GPX 1.0/1.1; track
      points are used first, then route points, then waypoints). Optionally ride it in reverse or there-and-back. For
      sparse route-planner files (≤ 25 route points) the app can follow bike roads between the points.
